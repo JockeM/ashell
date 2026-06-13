@@ -6,6 +6,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::xdg;
 use anyhow::{Context, Result, anyhow};
@@ -17,6 +18,7 @@ use iced::futures::StreamExt;
 
 /// Maximum bytes to read from a client connection.
 const MAX_REQUEST_LEN: u64 = 4096;
+const MAX_RESPONSE_LEN: u64 = 1024 * 1024;
 
 /// IPC command that can be sent to the daemon.
 #[derive(Subcommand, Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,12 +76,76 @@ pub enum IpcCommand {
         #[serde(default)]
         no_osd: bool,
     },
+    /// Clear all notifications
+    NotificationsClear {
+        #[arg(short = 'n', long = "id")]
+        id: Option<u32>,
+    },
+    /// Invoke a notification action
+    NotificationsInvoke {
+        #[arg(short = 'n', long = "id")]
+        id: Option<u32>,
+        action: Option<String>,
+    },
+    /// List active notifications as JSON
+    NotificationsList,
+}
+
+#[derive(Debug, Clone)]
+pub struct IpcRequest {
+    command: IpcCommand,
+    response: IpcResponse,
+}
+
+impl IpcRequest {
+    fn new(command: IpcCommand, stream: UnixStream) -> Self {
+        Self {
+            command,
+            response: IpcResponse::new(stream),
+        }
+    }
+
+    pub fn command(&self) -> &IpcCommand {
+        &self.command
+    }
+    pub fn respond_ok(&self) {
+        self.respond("ok");
+    }
+    pub fn respond_error(&self, error: &str) {
+        self.respond(&format!("error {error}"));
+    }
+    pub fn respond(&self, response: &str) {
+        self.response.respond(response);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IpcResponse {
+    stream: Arc<Mutex<Option<UnixStream>>>,
+}
+
+impl IpcResponse {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream: Arc::new(Mutex::new(Some(stream))),
+        }
+    }
+    fn respond(&self, response: &str) {
+        if let Ok(mut stream) = self.stream.lock()
+            && let Some(mut stream) = stream.take()
+        {
+            write_response(&mut stream, response);
+        }
+    }
 }
 
 impl IpcCommand {
     pub fn no_osd(&self) -> bool {
         match self {
-            IpcCommand::ToggleVisibility => false,
+            IpcCommand::ToggleVisibility
+            | IpcCommand::NotificationsClear { .. }
+            | IpcCommand::NotificationsInvoke { .. }
+            | IpcCommand::NotificationsList => false,
             IpcCommand::VolumeUp { no_osd }
             | IpcCommand::VolumeDown { no_osd }
             | IpcCommand::VolumeToggleMute { no_osd }
@@ -121,7 +187,7 @@ pub fn run_client(cmd: &IpcCommand) -> Result<()> {
     stream.shutdown(std::net::Shutdown::Write)?;
 
     let mut response = String::new();
-    BufReader::new((&stream).take(MAX_REQUEST_LEN))
+    BufReader::new((&stream).take(MAX_RESPONSE_LEN))
         .read_line(&mut response)
         .context("read response")?;
     let response = response.trim_end();
@@ -209,12 +275,9 @@ fn write_response(stream: &mut UnixStream, response: &str) {
 }
 
 /// Handle a single accepted client connection.
-fn handle_connection(mut stream: UnixStream) -> Option<IpcCommand> {
+fn handle_connection(mut stream: UnixStream) -> Option<IpcRequest> {
     match read_request(&stream) {
-        Ok(cmd) => {
-            write_response(&mut stream, "ok");
-            Some(cmd)
-        }
+        Ok(cmd) => Some(IpcRequest::new(cmd, stream)),
         Err(e) => {
             write_response(&mut stream, &format!("error {e:#}"));
             None
@@ -246,7 +309,7 @@ fn init_listener() -> Option<tokio::net::UnixListener> {
 }
 
 /// Subscription that listens for IPC commands on the Unix socket.
-pub fn subscription() -> Subscription<IpcCommand> {
+pub fn subscription() -> Subscription<IpcRequest> {
     Subscription::run(|| {
         iced::futures::stream::unfold(None::<tokio::net::UnixListener>, |listener| async {
             let listener = match listener {

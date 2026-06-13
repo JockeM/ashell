@@ -503,6 +503,41 @@ impl App {
                         .update_toast_input_region(content_size, position)
                 }
             },
+            Message::IpcRequest(request) => match request.command() {
+                IpcCommand::ToggleVisibility => {
+                    request.respond_ok();
+                    self.update(Message::ToggleVisibility)
+                }
+                IpcCommand::NotificationsClear { id } => {
+                    request.respond_ok();
+                    let message = match id {
+                        Some(id) => modules::notifications::Message::CloseNotificationById(*id),
+                        None => modules::notifications::Message::ClearNotifications,
+                    };
+                    self.update(Message::Notifications(message))
+                }
+                IpcCommand::NotificationsInvoke { id, action } => {
+                    request.respond_ok();
+                    let action_key = action.clone().unwrap_or_else(|| "default".to_string());
+                    self.update(Message::Notifications(
+                        modules::notifications::Message::InvokeAction {
+                            id: *id,
+                            action_key,
+                        },
+                    ))
+                }
+                IpcCommand::NotificationsList => {
+                    match self.notifications.list_json() {
+                        Ok(json) => request.respond(&json),
+                        Err(e) => request.respond_error(&format!("serialize notifications: {e}")),
+                    }
+                    Task::none()
+                }
+                command => {
+                    request.respond_ok();
+                    self.update(Message::IpcOsdCommand(command.clone()))
+                }
+            },
             Message::IpcOsdCommand(cmd) => {
                 let mut tasks = vec![];
 
@@ -520,7 +555,10 @@ impl App {
                     IpcCommand::BrightnessDown { .. } => self.settings.brightness_adjust(false),
                     IpcCommand::ToggleAirplaneMode { .. } => self.settings.toggle_airplane(),
                     IpcCommand::ToggleIdleInhibitor { .. } => self.settings.toggle_idle_inhibitor(),
-                    IpcCommand::ToggleVisibility => {
+                    IpcCommand::ToggleVisibility
+                    | IpcCommand::NotificationsClear { .. }
+                    | IpcCommand::NotificationsInvoke { .. }
+                    | IpcCommand::NotificationsList => {
                         warn!(
                             "IpcCommand::ToggleVisibility reached IpcOsdCommand handler; use Message::ToggleVisibility instead"
                         );
@@ -769,10 +807,7 @@ impl App {
             // Always subscribe to audio/brightness services so OSD works
             // even when the Settings module isn't in the module list.
             self.settings.subscription().map(Message::Settings),
-            crate::ipc::subscription().map(|cmd| match cmd {
-                IpcCommand::ToggleVisibility => Message::ToggleVisibility,
-                other => Message::IpcOsdCommand(other),
-            }),
+            crate::ipc::subscription().map(Message::IpcRequest),
         ])
     }
 }
